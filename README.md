@@ -71,6 +71,10 @@ the policy is turned off. Use an unmanaged machine/VM if you cannot change it.
 4. When ≤ 100 candidates remain they are listed; edit a **Value** cell to write it to
    the target. **Reset Search** clears the state and re-enables the type control.
 
+Direct searches scan in 4 MB chunks across the **Options → Scan threads** workers, keep
+matches as per-chunk bitmaps (no address list), and match values with SIMD when
+**Size-aligned** is on.
+
 ### Unknown-value search
 
 If you don't know the value yet, leave the **Value** box empty and press **Search**:
@@ -82,10 +86,13 @@ change the value in the target and press:
 - **`=`** keep addresses whose value is unchanged.
 
 Each press compares against the previous snapshot and updates it, so repeated presses
-narrow the list. Because it records every address, an unknown scan uses a lot of
-memory — the **Writable only** and **Size-aligned** options (which also apply to direct
-searches) reduce it. Direct and unknown searches are mutually exclusive: once one has
-started, the other's controls stay locked until **Reset Search**.
+narrow the list. The scan keeps a byte-for-byte snapshot of the scanned regions (two
+buffers per region, so roughly twice the scanned size) and runs the comparison
+multithreaded with SIMD; change the worker count under **Options → Scan threads**.
+Regions with no surviving candidates are released after each pass. The **Writable only**
+and **Size-aligned** options (which also apply to direct searches) reduce how much is
+scanned. Direct and unknown searches are mutually exclusive: once one has started, the
+other's controls stay locked until **Reset Search**.
 
 ### Access tracking
 

@@ -35,6 +35,7 @@ public partial class MainWindow : Window
     private UnknownValueScanner? _unknown;
     private MemoryValueType _activeType = MemoryValueType.DWord;
     private AccessMechanism _accessMechanism = AccessMechanism.InProcessVeh;
+    private int _scanThreads;
 
     public MainWindow()
     {
@@ -47,7 +48,9 @@ public partial class MainWindow : Window
         TypeCombo.SelectedValuePath = nameof(ValueTypeOption.Type);
         TypeCombo.SelectedValue = MemoryValueType.DWord;
 
+        ThreadsAuto.Header = $"Auto ({Environment.ProcessorCount} cores)";
         UpdateAccessTypeChecks();
+        UpdateScanThreadChecks();
         ApplySearchControls();
         StartFreezeTimer();
     }
@@ -89,6 +92,34 @@ public partial class MainWindow : Window
         AccessTypeHw.IsChecked = _accessMechanism == AccessMechanism.HardwareBreakpoints;
         AccessTypeGuard.IsChecked = _accessMechanism == AccessMechanism.GuardPage;
         AccessTypeVeh.IsChecked = _accessMechanism == AccessMechanism.InProcessVeh;
+    }
+
+    private void ScanThreads_Click(object sender, RoutedEventArgs e)
+    {
+        if (ReferenceEquals(sender, ThreadsAuto))
+            _scanThreads = 0;
+        else if (ReferenceEquals(sender, Threads1))
+            _scanThreads = 1;
+        else if (ReferenceEquals(sender, Threads2))
+            _scanThreads = 2;
+        else if (ReferenceEquals(sender, Threads4))
+            _scanThreads = 4;
+        else if (ReferenceEquals(sender, Threads8))
+            _scanThreads = 8;
+        else
+            _scanThreads = 16;
+
+        UpdateScanThreadChecks();
+    }
+
+    private void UpdateScanThreadChecks()
+    {
+        ThreadsAuto.IsChecked = _scanThreads == 0;
+        Threads1.IsChecked = _scanThreads == 1;
+        Threads2.IsChecked = _scanThreads == 2;
+        Threads4.IsChecked = _scanThreads == 4;
+        Threads8.IsChecked = _scanThreads == 8;
+        Threads16.IsChecked = _scanThreads == 16;
     }
 
     private void AttachProcess(ProcessItem item)
@@ -184,7 +215,7 @@ public partial class MainWindow : Window
         lock (_scanLock)
         {
             if (!_typeLocked || _scanner is null)
-                _scanner = new MemoryScanner(_memory, type, writableOnly, aligned);
+                _scanner = new MemoryScanner(_memory, type, writableOnly, aligned, _scanThreads);
             scanner = _scanner;
         }
 
@@ -202,11 +233,11 @@ public partial class MainWindow : Window
                 StatusText.Text = $"Scanning... {p.RegionsDone}/{p.RegionsTotal} regions, {p.Found} match(es).";
             });
 
-            IReadOnlyList<ulong> results = await scanner.ScanAsync(searchText, progress, _cts.Token);
+            await scanner.ScanAsync(searchText, progress, _cts.Token);
 
             _typeLocked = true;
             _mode = SearchMode.Direct;
-            UpdateResults(results, results.Count);
+            UpdateResults(scanner.Addresses(ResultThreshold + 1), scanner.Count);
         }
         catch (FormatException ex)
         {
@@ -233,7 +264,7 @@ public partial class MainWindow : Window
         if (_memory is null)
             return;
 
-        var scanner = new UnknownValueScanner(_memory, type, writableOnly, aligned);
+        var scanner = new UnknownValueScanner(_memory, type, writableOnly, aligned, _scanThreads);
         _unknown = scanner;
         _activeType = type;
         _isScanning = true;
@@ -355,7 +386,7 @@ public partial class MainWindow : Window
         EqualButton.IsEnabled = enabled;
     }
 
-    private void UpdateResults(IEnumerable<ulong> results, int total)
+    private void UpdateResults(IEnumerable<ulong> results, long total)
     {
         _results.Clear();
 

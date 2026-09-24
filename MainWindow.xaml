@@ -32,6 +32,15 @@
                     <MenuItem x:Name="AccessTypeVeh" Header="In-process VEH (no debugger)"
                               IsCheckable="True" Click="AccessType_Click" />
                 </MenuItem>
+                <MenuItem Header="Scan threads">
+                    <MenuItem x:Name="ThreadsAuto" Header="Auto" IsCheckable="True" Click="ScanThreads_Click" />
+                    <Separator />
+                    <MenuItem x:Name="Threads1" Header="1" IsCheckable="True" Click="ScanThreads_Click" />
+                    <MenuItem x:Name="Threads2" Header="2" IsCheckable="True" Click="ScanThreads_Click" />
+                    <MenuItem x:Name="Threads4" Header="4" IsCheckable="True" Click="ScanThreads_Click" />
+                    <MenuItem x:Name="Threads8" Header="8" IsCheckable="True" Click="ScanThreads_Click" />
+                    <MenuItem x:Name="Threads16" Header="16" IsCheckable="True" Click="ScanThreads_Click" />
+                </MenuItem>
             </MenuItem>
             <MenuItem Header="_Windows">
                 <MenuItem Header="Code browser..." Click="CodeBrowserMenuItem_Click" />

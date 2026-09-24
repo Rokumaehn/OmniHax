@@ -43,6 +43,12 @@ dotnet build -o "$env:TEMP\omnihax-verify"
   applies script entries with `AssemblerService.Apply` and reverts them using the
   `EditResult` original bytes plus the code-cave address; the main window drives it
   from a `DispatcherTimer` and each entry's `PropertyChanged`.
+- The unknown-value scan (`UnknownValueScanner.cs`) keeps per-chunk ping-pong byte
+  snapshots and compares them in parallel with `VectorCompare.cs` (SIMD keep-masks,
+  scalar fallback); the worker count comes from `Options → Scan threads`.
+- The direct scan (`MemoryScanner.cs`) keeps per-chunk bitmaps of matching candidate
+  offsets and refines them in parallel, matching with `VectorCompare.EqualsMask64`
+  when size-aligned and `IndexOf` otherwise.
 
 ## Conventions
 
