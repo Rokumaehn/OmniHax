@@ -650,13 +650,6 @@ public partial class MainWindow : Window
         if (_memory is null || _disassembly is null || _assembler is null)
             return;
 
-        if (!_memory.Is64BitProcess)
-        {
-            MessageBox.Show(this, "Access tracking is only supported for 64-bit target processes.",
-                "Omni Hax", MessageBoxButton.OK, MessageBoxImage.Warning);
-            return;
-        }
-
         ResultRow? row = GetSelectedRow();
         if (row is null)
             return;
@@ -665,7 +658,7 @@ public partial class MainWindow : Window
         AccessMechanism mechanism = _accessMechanism;
 
         var window = new AccessTrackerWindow(_memory, _disassembly, _assembler, row.AddressValue, mode, size,
-            mechanism: mechanism, registerScript: RegisterScript)
+            mechanism: mechanism, registerScript: RegisterScript, valueType: _scanner?.ValueType)
         {
             Owner = this
         };
@@ -692,6 +685,13 @@ public partial class MainWindow : Window
         if (_memory is null || _disassembly is null || _assembler is null)
             return;
 
+        if (!_memory.Is64BitProcess)
+        {
+            MessageBox.Show(this, "Diagnostics probes are only supported for 64-bit target processes.",
+                "Omni Hax", MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
         ulong address = 0;
         if (!IsDecoy(probeMode))
         {
@@ -704,6 +704,22 @@ public partial class MainWindow : Window
         int size = _scanner is not null ? MemoryValueTypeInfo.SizeOf(_scanner.ValueType) : 4;
         var window = new AccessTrackerWindow(_memory, _disassembly, _assembler, address, AccessKind.Write, size, probeMode,
             registerScript: RegisterScript)
+        {
+            Owner = this
+        };
+        window.Show();
+    }
+
+    private void StructureBrowserMenuItem_Click(object sender, RoutedEventArgs e)
+    {
+        if (_memory is null)
+        {
+            MessageBox.Show(this, "Open a process first.", "Structure Browser",
+                MessageBoxButton.OK, MessageBoxImage.Information);
+            return;
+        }
+
+        var window = new StructureBrowserWindow(_memory, StructureType.DWord, GetDefaultBrowseAddress())
         {
             Owner = this
         };

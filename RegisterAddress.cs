@@ -8,7 +8,7 @@ namespace OmniHax;
 /// </summary>
 internal static class RegisterAddress
 {
-    public static bool TryCompute(in UsedMemory memory, in NativeMethods.CONTEXT64 context, out ulong address)
+    public static bool TryCompute(in UsedMemory memory, in TargetContext context, out ulong address)
     {
         address = memory.Displacement;
 
@@ -61,7 +61,7 @@ internal static class RegisterAddress
     public static bool IsRead(OpAccess access) =>
         access is OpAccess.Read or OpAccess.CondRead or OpAccess.ReadWrite or OpAccess.ReadCondWrite;
 
-    public static bool TryGetRegisterValue(Register register, in NativeMethods.CONTEXT64 c, out ulong value)
+    public static bool TryGetRegisterValue(Register register, in TargetContext c, out ulong value)
     {
         switch (register)
         {

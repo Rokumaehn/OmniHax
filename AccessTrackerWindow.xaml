@@ -8,6 +8,9 @@
         Title="Access Tracking" Height="560" Width="900"
         WindowStartupLocation="CenterOwner"
         Closing="Window_Closing">
+    <Window.Resources>
+        <BooleanToVisibilityConverter x:Key="BoolToVis" />
+    </Window.Resources>
     <Grid Margin="10">
         <Grid.RowDefinitions>
             <RowDefinition Height="Auto" />
@@ -27,6 +30,7 @@
                   GridLinesVisibility="Horizontal"
                   SelectionMode="Single"
                   RowHeaderWidth="0"
+                  RowDetailsVisibilityMode="Visible"
                   MouseDoubleClick="HitsGrid_MouseDoubleClick"
                   PreviewMouseRightButtonDown="HitsGrid_PreviewMouseRightButtonDown">
             <DataGrid.ContextMenu>
@@ -34,7 +38,54 @@
                     <MenuItem Header="Register" Click="RegisterHit_Click" />
                 </ContextMenu>
             </DataGrid.ContextMenu>
+            <DataGrid.RowDetailsTemplate>
+                <DataTemplate>
+                    <ScrollViewer HorizontalScrollBarVisibility="Auto"
+                                  VerticalScrollBarVisibility="Disabled"
+                                  Margin="26,2,4,6"
+                                  MaxHeight="220"
+                                  Visibility="{Binding IsExpanded, Converter={StaticResource BoolToVis}}">
+                        <DataGrid ItemsSource="{Binding Records}"
+                                  AutoGenerateColumns="False"
+                                  CanUserAddRows="False"
+                                  CanUserResizeRows="False"
+                                  IsReadOnly="True"
+                                  HeadersVisibility="Column"
+                                  GridLinesVisibility="Horizontal"
+                                  HorizontalScrollBarVisibility="Disabled"
+                                  RowHeaderWidth="0"
+                                  MouseDoubleClick="RecordsGrid_MouseDoubleClick">
+                            <DataGrid.Columns>
+                                <DataGridTextColumn Header="Time" Width="160" Binding="{Binding TimestampText}" />
+                                <DataGridTextColumn Header="Value" Width="520" Binding="{Binding ValueDisplay}" />
+                            </DataGrid.Columns>
+                        </DataGrid>
+                    </ScrollViewer>
+                </DataTemplate>
+            </DataGrid.RowDetailsTemplate>
             <DataGrid.Columns>
+                <DataGridTemplateColumn Width="30">
+                    <DataGridTemplateColumn.CellTemplate>
+                        <DataTemplate>
+                            <ToggleButton IsChecked="{Binding IsExpanded, Mode=TwoWay}" Width="22" Height="18"
+                                          HorizontalAlignment="Center" VerticalAlignment="Center"
+                                          Focusable="False"
+                                          PreviewMouseLeftButtonDown="HitToggle_PreviewMouseLeftButtonDown"
+                                          ToolTip="Show each hit">
+                                <ToggleButton.Style>
+                                    <Style TargetType="ToggleButton">
+                                        <Setter Property="Content" Value="+" />
+                                        <Style.Triggers>
+                                            <Trigger Property="IsChecked" Value="True">
+                                                <Setter Property="Content" Value="-" />
+                                            </Trigger>
+                                        </Style.Triggers>
+                                    </Style>
+                                </ToggleButton.Style>
+                            </ToggleButton>
+                        </DataTemplate>
+                    </DataGridTemplateColumn.CellTemplate>
+                </DataGridTemplateColumn>
                 <DataGridTextColumn Header="Address" Width="150" Binding="{Binding AddressText}" />
                 <DataGridTextColumn Header="Eff. address" Width="150" Binding="{Binding EffectiveAddressText}" />
                 <DataGridTextColumn Header="Access" Width="90" Binding="{Binding KindText}" />

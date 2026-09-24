@@ -126,7 +126,7 @@ internal sealed class ExternalBreakpointProbe : IAccessTracker, IDisposable
         IntPtr raw = Marshal.AllocHGlobal(ContextSize + 16);
         IntPtr aligned = (IntPtr)((raw.ToInt64() + 15) & ~15L);
         IntPtr handle = NativeMethods.OpenThread(
-            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT | NativeMethods.THREAD_SUSPEND_RESUME,
+            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT,
             false,
             threadId);
 
@@ -140,39 +140,26 @@ internal sealed class ExternalBreakpointProbe : IAccessTracker, IDisposable
                 return false;
             }
 
-            if (NativeMethods.SuspendThread(handle) == unchecked((uint)-1))
+            var context = new NativeMethods.CONTEXT64 { ContextFlags = NativeMethods.CONTEXT_DEBUG_REGISTERS };
+            Marshal.StructureToPtr(context, aligned, false);
+
+            if (!NativeMethods.GetThreadContext(handle, aligned))
             {
-                LogFailure($"SuspendThread({threadId}) failed (err={Marshal.GetLastWin32Error()})");
+                LogFailure($"GetThreadContext({threadId}) failed (err={Marshal.GetLastWin32Error()})");
                 return false;
             }
 
-            try
-            {
-                var context = new NativeMethods.CONTEXT64 { ContextFlags = NativeMethods.CONTEXT_DEBUG_REGISTERS };
-                Marshal.StructureToPtr(context, aligned, false);
+            context = Marshal.PtrToStructure<NativeMethods.CONTEXT64>(aligned);
+            _original[threadId] = new DebugRegisters(context.Dr0, context.Dr1, context.Dr2, context.Dr3, context.Dr7);
 
-                if (!NativeMethods.GetThreadContext(handle, aligned))
-                {
-                    LogFailure($"GetThreadContext({threadId}) failed (err={Marshal.GetLastWin32Error()})");
-                    return false;
-                }
+            context.Dr0 = _watchAddress;
+            context.Dr7 = BuildDr7(context.Dr7);
 
-                context = Marshal.PtrToStructure<NativeMethods.CONTEXT64>(aligned);
-                _original[threadId] = new DebugRegisters(context.Dr0, context.Dr1, context.Dr2, context.Dr3, context.Dr7);
+            Marshal.StructureToPtr(context, aligned, false);
+            succeeded = NativeMethods.SetThreadContext(handle, aligned);
 
-                context.Dr0 = _watchAddress;
-                context.Dr7 = BuildDr7(context.Dr7);
-
-                Marshal.StructureToPtr(context, aligned, false);
-                succeeded = NativeMethods.SetThreadContext(handle, aligned);
-
-                if (!succeeded)
-                    LogFailure($"SetThreadContext({threadId}) failed (err={Marshal.GetLastWin32Error()})");
-            }
-            finally
-            {
-                NativeMethods.ResumeThread(handle);
-            }
+            if (!succeeded)
+                LogFailure($"SetThreadContext({threadId}) failed (err={Marshal.GetLastWin32Error()})");
         }
         finally
         {
@@ -248,7 +235,7 @@ internal sealed class ExternalBreakpointProbe : IAccessTracker, IDisposable
         IntPtr raw = Marshal.AllocHGlobal(ContextSize + 16);
         IntPtr aligned = (IntPtr)((raw.ToInt64() + 15) & ~15L);
         IntPtr handle = NativeMethods.OpenThread(
-            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT | NativeMethods.THREAD_SUSPEND_RESUME,
+            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT,
             false,
             threadId);
 
@@ -257,29 +244,19 @@ internal sealed class ExternalBreakpointProbe : IAccessTracker, IDisposable
             if (handle == IntPtr.Zero)
                 return;
 
-            if (NativeMethods.SuspendThread(handle) == unchecked((uint)-1))
-                return;
+            var context = new NativeMethods.CONTEXT64 { ContextFlags = NativeMethods.CONTEXT_DEBUG_REGISTERS };
+            Marshal.StructureToPtr(context, aligned, false);
 
-            try
+            if (NativeMethods.GetThreadContext(handle, aligned))
             {
-                var context = new NativeMethods.CONTEXT64 { ContextFlags = NativeMethods.CONTEXT_DEBUG_REGISTERS };
+                context = Marshal.PtrToStructure<NativeMethods.CONTEXT64>(aligned);
+                context.Dr0 = original.Dr0;
+                context.Dr1 = original.Dr1;
+                context.Dr2 = original.Dr2;
+                context.Dr3 = original.Dr3;
+                context.Dr7 = original.Dr7;
                 Marshal.StructureToPtr(context, aligned, false);
-
-                if (NativeMethods.GetThreadContext(handle, aligned))
-                {
-                    context = Marshal.PtrToStructure<NativeMethods.CONTEXT64>(aligned);
-                    context.Dr0 = original.Dr0;
-                    context.Dr1 = original.Dr1;
-                    context.Dr2 = original.Dr2;
-                    context.Dr3 = original.Dr3;
-                    context.Dr7 = original.Dr7;
-                    Marshal.StructureToPtr(context, aligned, false);
-                    NativeMethods.SetThreadContext(handle, aligned);
-                }
-            }
-            finally
-            {
-                NativeMethods.ResumeThread(handle);
+                NativeMethods.SetThreadContext(handle, aligned);
             }
         }
         finally

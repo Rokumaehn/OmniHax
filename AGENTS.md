@@ -49,6 +49,22 @@ dotnet build -o "$env:TEMP\omnihax-verify"
 - The direct scan (`MemoryScanner.cs`) keeps per-chunk bitmaps of matching candidate
   offsets and refines them in parallel, matching with `VectorCompare.EqualsMask64`
   when size-aligned and `IndexOf` otherwise.
+- Access tracking supports 32-bit (WOW64) targets: `TargetContext.cs` reads/writes
+  thread contexts via `Wow64Get/SetThreadContext`, `ShellcodeAgent` has an x86 agent
+  backend (`AgentLayout`), and `PeExports.cs` resolves target exports by parsing the
+  loaded module's PE export directory. The diagnostic probes stay 64-bit only.
+- **Safety invariants for access tracking (do not regress):** never call
+  `SuspendThread`/`ResumeThread` on a foreign thread — suspending a thread that holds
+  a kernel lock can hard-hang the machine (`CLOCK_WATCHDOG_TIMEOUT`). The page-guard
+  mechanism must **not** use the trap flag (`EFlags.TF`); it re-arms `PAGE_GUARD` after
+  a short delay (`GuardRearmDelayMs`) so the faulting instruction executes first
+  (execute-via-guard is one-shot). `TargetGuard.Verify` re-checks the target identity
+  (pid/name/start time) before any attach or injection.
+- Each hit stores a `HitRecord` (timestamp, accessed value, and a register snapshot:
+  GPRs, EFlags, segments, x87, XMM, DRs, MXCSR) under `AccessHit.Records`. The
+  in-process agent captures this extra state via `AgentLayout` entry offsets shared
+  with `InProcessBreakpointTracker.BuildContext`; record additions are marshalled to
+  the UI thread through the `SynchronizationContext` captured in `Start()`.
 
 ## Conventions
 

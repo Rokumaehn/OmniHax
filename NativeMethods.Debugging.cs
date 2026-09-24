@@ -12,6 +12,11 @@ internal static partial class NativeMethods
     public const uint STATUS_ACCESS_VIOLATION = 0xC0000005;
     public const uint STATUS_GUARD_PAGE_VIOLATION = 0x80000001;
 
+    // WOW64 variants surfaced to a 64-bit debugger when the exception came from
+    // 32-bit code.
+    public const uint STATUS_WX86_SINGLE_STEP = 0x4000001E;
+    public const uint STATUS_WX86_BREAKPOINT = 0x4000001F;
+
     public const uint EXCEPTION_DEBUG_EVENT = 1;
     public const uint CREATE_THREAD_DEBUG_EVENT = 2;
     public const uint CREATE_PROCESS_DEBUG_EVENT = 3;
@@ -35,6 +40,16 @@ internal static partial class NativeMethods
     public const uint CONTEXT_DEBUG_REGISTERS = 0x00100010;
     public const uint CONTEXT_CONTROL = 0x00100001;
     public const uint CONTEXT_INTEGER = 0x00100002;
+    public const uint CONTEXT_SEGMENTS = 0x00100004;
+    public const uint CONTEXT_FLOATING_POINT = 0x00100008;
+
+    // WOW64 (x86) CONTEXT flags.
+    public const uint WOW64_CONTEXT_CONTROL = 0x00010001;
+    public const uint WOW64_CONTEXT_INTEGER = 0x00010002;
+    public const uint WOW64_CONTEXT_SEGMENTS = 0x00010004;
+    public const uint WOW64_CONTEXT_FLOATING_POINT = 0x00010008;
+    public const uint WOW64_CONTEXT_DEBUG_REGISTERS = 0x00010010;
+    public const uint WOW64_CONTEXT_EXTENDED_REGISTERS = 0x00010020;
 
     // ---- Memory allocation / protection ----
     public const uint MEM_RESERVE = 0x2000;
@@ -112,6 +127,31 @@ internal static partial class NativeMethods
         [FieldOffset(0xE8)] public ulong R14;
         [FieldOffset(0xF0)] public ulong R15;
         [FieldOffset(0xF8)] public ulong Rip;
+    }
+
+    // x86 (WOW64) CONTEXT laid out explicitly; only the fields we need are exposed.
+    [StructLayout(LayoutKind.Explicit, Size = 0x2CC)]
+    public struct WOW64_CONTEXT
+    {
+        [FieldOffset(0x00)] public uint ContextFlags;
+        [FieldOffset(0x04)] public uint Dr0;
+        [FieldOffset(0x08)] public uint Dr1;
+        [FieldOffset(0x0C)] public uint Dr2;
+        [FieldOffset(0x10)] public uint Dr3;
+        [FieldOffset(0x14)] public uint Dr6;
+        [FieldOffset(0x18)] public uint Dr7;
+        [FieldOffset(0x9C)] public uint Edi;
+        [FieldOffset(0xA0)] public uint Esi;
+        [FieldOffset(0xA4)] public uint Ebx;
+        [FieldOffset(0xA8)] public uint Edx;
+        [FieldOffset(0xAC)] public uint Ecx;
+        [FieldOffset(0xB0)] public uint Eax;
+        [FieldOffset(0xB4)] public uint Ebp;
+        [FieldOffset(0xB8)] public uint Eip;
+        [FieldOffset(0xBC)] public uint SegCs;
+        [FieldOffset(0xC0)] public uint EFlags;
+        [FieldOffset(0xC4)] public uint Esp;
+        [FieldOffset(0xC8)] public uint SegSs;
     }
 
     [StructLayout(LayoutKind.Sequential)]
@@ -199,6 +239,14 @@ internal static partial class NativeMethods
     [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool SetThreadContext(IntPtr hThread, IntPtr lpContext);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool Wow64GetThreadContext(IntPtr hThread, IntPtr lpContext);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool Wow64SetThreadContext(IntPtr hThread, IntPtr lpContext);
 
     [DllImport("ntdll.dll")]
     public static extern int NtQueryInformationThread(

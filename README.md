@@ -108,6 +108,17 @@ Right-click an address in the results list. Pick a mechanism under
 Then choose **Find out what writes / accesses / executes this address**. Hits appear
 in a list; double-click a hit to open it in the code browser.
 
+Each instruction row has a **+** toggle that expands a per-hit table (timestamp and the
+accessed value). Double-clicking a hit opens a register window with the captured state:
+general-purpose registers, EFLAGS, segment selectors, x87 (ST0–ST7 as floating-point),
+SSE (XMM, switchable between 4x float and 2x double), debug registers and MXCSR. Data
+breakpoints capture the post-instruction state; page-guard captures the pre-instruction
+state.
+
+All three mechanisms work for both **32-bit (WOW64)** and 64-bit targets: thread
+contexts are read through `Wow64GetThreadContext` for 32-bit targets, and the injected
+VEH agent is built as x86 shellcode. The **Diagnostics** probes remain 64-bit only.
+
 > Background: `ThreadHideFromDebugger` stops a thread's exceptions from reaching a
 > debugger, so debugger-based hardware/guard breakpoints silently miss (and can crash)
 > such targets. A Vectored Exception Handler runs in-process and **is** still invoked,
@@ -151,6 +162,13 @@ here*). It opens at the selected result or the target's main module base; use th
   operands with size hints, `lock`, direct branches); unsupported syntax reports an
   error.
 
+### Structure browser
+
+**Windows → Structure browser** shows raw memory starting at an address, interpreted as
+a chosen datatype (Byte … Double, or Pointer, which is pointer-sized for the target and
+shown in hex). It steps by the datatype size for 128 rows (editable); change the type or
+use **Go**/**Refresh** to re-read. Read-only.
+
 ### Diagnostics
 
 Every tracking window has a **Diagnostics** expander (Copy / Save). The **Diagnostics**
@@ -161,9 +179,11 @@ detects these techniques.
 
 ## Known limitations
 
-- x64 targets only (32-bit/WOW64 is rejected).
+- Access tracking supports both 32-bit (WOW64) and 64-bit targets.
 - Hardware breakpoints: 4 slots; the tracker preserves/restores existing debug registers.
-- The page-guard mechanism is page-granular and can slow a busy page. For execute watches it single-steps instructions on the page until the watched instruction runs (capped at 200,000 steps), then records the first execution and stops.
+- The page-guard mechanism is page-granular and can slow a busy page. It re-arms the
+  guard after a short delay (no trap flag); execute-via-guard records the first execution
+  on the page and stops.
 - The in-process VEH mechanism requires code injection; on a kernel anti-cheat it will
   be detected or blocked.
 - The assembler supports a subset of instructions.
@@ -186,5 +206,10 @@ detects these techniques.
 | `NativeMethods*.cs` | P/Invoke (kernel32/user32/ntdll/psapi/advapi32). |
 | `DisassemblyService.cs`, `AssemblerService.cs` | Disassembly and assembling/code caves. |
 | `CodeBrowserWindow.xaml(.cs)` | Disassembly browser + assembly editing. |
-| `AccessTrackerWindow.xaml(.cs)` | Hits list, diagnostics pane, auto-stop. |
+| `StructureBrowserWindow.xaml(.cs)` | Typed memory viewer (Windows menu). |
+| `AccessTrackerWindow.xaml(.cs)` | Hits list, per-hit records, diagnostics pane, auto-stop. |
+| `HitRecord.cs`, `HitDetailsWindow.xaml(.cs)` | Per-hit register snapshot and its viewer. |
+| `CodeEntry.cs`, `CodeManager.cs`, `ScriptEditorWindow.xaml(.cs)` | Codes (freeze list) tab. |
+| `UnknownValueScanner.cs`, `VectorCompare.cs` | Unknown-value scan + SIMD comparison. |
+| `TargetContext.cs`, `PeExports.cs`, `TargetModules.cs`, `TargetGuard.cs` | WOW64 context, target export parsing, module enumeration, target validation. |
 | `Privileges.cs` | Enables `SeDebugPrivilege`. |

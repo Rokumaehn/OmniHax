@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.Collections.ObjectModel;
 using System.ComponentModel;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
@@ -18,6 +19,7 @@ internal sealed class AccessHit : INotifyPropertyChanged
 {
     private string _disassembly;
     private int _count;
+    private bool _isExpanded;
 
     public AccessHit(ulong instructionAddress, uint threadId, AccessKind kind, string disassembly, byte[] bytes, ulong effectiveAddress)
     {
@@ -35,6 +37,20 @@ internal sealed class AccessHit : INotifyPropertyChanged
     public AccessKind Kind { get; }
     public byte[] Bytes { get; }
     public ulong EffectiveAddress { get; }
+
+    public ObservableCollection<HitRecord> Records { get; } = new();
+
+    public bool IsExpanded
+    {
+        get => _isExpanded;
+        set
+        {
+            if (_isExpanded == value)
+                return;
+            _isExpanded = value;
+            OnPropertyChanged(nameof(IsExpanded));
+        }
+    }
 
     public string EffectiveAddressText => EffectiveAddress == 0 ? "?" : $"0x{EffectiveAddress:X}";
 
@@ -83,13 +99,10 @@ internal sealed class AccessHit : INotifyPropertyChanged
 /// </summary>
 internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
 {
-    private const int ContextSize = 1232;
-    private const uint ContextAll =
-        NativeMethods.CONTEXT_DEBUG_REGISTERS | NativeMethods.CONTEXT_INTEGER | NativeMethods.CONTEXT_CONTROL;
-
-    // Cap on page-guard execute single-steps while advancing toward the watched
-    // instruction; prevents hanging a busy page.
-    private const long MaxGuardExecuteSteps = 200_000;
+    // Delay before re-arming a page guard after a hit, so the faulting instruction
+    // has executed (the OS clears the guard bit on the first access). Re-arming
+    // immediately would re-fault forever; we deliberately avoid the trap flag.
+    private const int GuardRearmDelayMs = 20;
 
     private readonly ProcessMemory _memory;
     private readonly DisassemblyService _disassembly;
@@ -99,11 +112,13 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
     private readonly int _size;
     private readonly bool _setBreakpoints;
     private readonly AccessMechanism _mechanism;
+    private readonly bool _is32Bit;
+    private readonly MemoryValueType? _valueType;
+    private SynchronizationContext? _ui;
     private readonly ConcurrentDictionary<ulong, AccessHit> _hits = new();
     private readonly ConcurrentDictionary<uint, DebugRegisters> _saved = new();
     private readonly ConcurrentDictionary<uint, int> _threadSlots = new();
     private readonly ConcurrentDictionary<uint, byte> _seenThreads = new();
-    private readonly ConcurrentDictionary<uint, byte> _pendingSingleStep = new();
     private readonly ConcurrentQueue<string> _log = new();
     private readonly List<(ulong Base, ulong End, string Name)> _modules = new();
     private readonly ManualResetEventSlim _loopExited = new(false);
@@ -129,12 +144,13 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
     private volatile bool _guardArmed;
     private int _guardViolationCount;
     private int _guardRearmCount;
-    private long _guardExecuteSteps;
+    private int _rearmPending;
     private bool _disposed;
 
     public HardwareBreakpointTracker(ProcessMemory memory, DisassemblyService disassembly, ulong address,
         AccessKind mode, int size, bool setBreakpoints = true,
-        AccessMechanism mechanism = AccessMechanism.HardwareBreakpoints)
+        AccessMechanism mechanism = AccessMechanism.HardwareBreakpoints,
+        MemoryValueType? valueType = null)
     {
         _memory = memory;
         _disassembly = disassembly;
@@ -142,6 +158,8 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
         _mode = mode;
         _setBreakpoints = setBreakpoints;
         _mechanism = mechanism;
+        _is32Bit = !memory.Is64BitProcess;
+        _valueType = valueType;
 
         if (mode == AccessKind.Execute)
         {
@@ -195,8 +213,9 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
         if (_running)
             return;
 
-        if (!_memory.Is64BitProcess)
-            throw new NotSupportedException("Access tracking is only supported for 64-bit target processes.");
+        TargetGuard.Verify(_memory);
+        _ui = SynchronizationContext.Current;
+        Log($"start: target verified (pid={_memory.ProcessId} {_memory.ProcessName})");
 
         LoadModules();
 
@@ -390,7 +409,7 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
     private void ProbeHiddenThread(uint threadId)
     {
         IntPtr handle = NativeMethods.OpenThread(
-            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT | NativeMethods.THREAD_SUSPEND_RESUME,
+            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT,
             false,
             threadId);
 
@@ -402,28 +421,10 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
 
         try
         {
-            IntPtr raw = Marshal.AllocHGlobal(ContextSize + 16);
-            IntPtr aligned = (IntPtr)((raw.ToInt64() + 15) & ~15L);
-
-            try
-            {
-                var context = new NativeMethods.CONTEXT64 { ContextFlags = NativeMethods.CONTEXT_DEBUG_REGISTERS };
-                Marshal.StructureToPtr(context, aligned, false);
-
-                if (NativeMethods.GetThreadContext(handle, aligned))
-                {
-                    context = Marshal.PtrToStructure<NativeMethods.CONTEXT64>(aligned);
-                    Log($"hidden thread {threadId}: OpenThread+GetThreadContext OK (dr0=0x{context.Dr0:X} dr7=0x{context.Dr7:X})");
-                }
-                else
-                {
-                    Log($"hidden thread {threadId}: GetThreadContext failed (err={Marshal.GetLastWin32Error()})");
-                }
-            }
-            finally
-            {
-                Marshal.FreeHGlobal(raw);
-            }
+            if (TargetThreadContext.TryRead(handle, _is32Bit, ContextParts.DebugRegisters, out TargetContext context))
+                Log($"hidden thread {threadId}: OpenThread+GetThreadContext OK (dr0=0x{context.Dr0:X} dr7=0x{context.Dr7:X})");
+            else
+                Log($"hidden thread {threadId}: GetThreadContext failed (err={Marshal.GetLastWin32Error()})");
         }
         finally
         {
@@ -539,7 +540,8 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
             // Some other guard page (e.g. the target's stack): leave it to the target.
         }
 
-        if (code == NativeMethods.EXCEPTION_SINGLE_STEP && firstChance == 1)
+        if ((code == NativeMethods.EXCEPTION_SINGLE_STEP || code == NativeMethods.STATUS_WX86_SINGLE_STEP) &&
+            firstChance == 1)
         {
             if (threadId == _remoteBreakThreadId)
             {
@@ -551,20 +553,14 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
 
             if (_mechanism == AccessMechanism.GuardPage)
             {
-                if (_pendingSingleStep.TryRemove(threadId, out _))
-                {
-                    RearmGuardPage();
-                    return NativeMethods.DBG_CONTINUE;
-                }
-
-                Log($"guard: foreign single-step passed: tid={threadId} rip=0x{exceptionAddress:X} ({Describe(exceptionAddress)})");
+                // Guard no longer uses the trap flag, so any single-step is foreign.
                 return NativeMethods.DBG_EXCEPTION_NOT_HANDLED;
             }
 
-            if (TryGetContext(threadId, ContextAll, out NativeMethods.CONTEXT64 context) &&
+            if (TryGetContext(threadId, ContextParts.All, out TargetContext context) &&
                 IsOurAccess(threadId, in context, out ResolvedAccess access))
             {
-                RecordHit(in access, threadId);
+                RecordHit(in access, threadId, in context);
                 return NativeMethods.DBG_CONTINUE;
             }
 
@@ -572,7 +568,8 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
             return NativeMethods.DBG_EXCEPTION_NOT_HANDLED;
         }
 
-        if (code == NativeMethods.EXCEPTION_BREAKPOINT && !_initialBreakpointHandled)
+        if ((code == NativeMethods.EXCEPTION_BREAKPOINT || code == NativeMethods.STATUS_WX86_BREAKPOINT) &&
+            !_initialBreakpointHandled)
         {
             // The OS injects ntdll!DbgUiRemoteBreakin on attach and it raises an
             // initial breakpoint that the debugger must swallow. Later breakpoints
@@ -589,88 +586,57 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
 
     private uint HandleGuardViolation(uint threadId, ulong exceptionAddress)
     {
-        if (!TryGetContext(threadId, ContextAll, out NativeMethods.CONTEXT64 context))
+        if (!TryGetContext(threadId, ContextParts.All, out TargetContext context))
         {
             Log($"guard: GetThreadContext({threadId}) failed");
+            ScheduleRearmGuardPage();
             return NativeMethods.DBG_CONTINUE;
         }
 
         bool ours = IsOurAccess(threadId, in context, out ResolvedAccess access);
         if (ours)
-            RecordHit(in access, threadId);
+            RecordHit(in access, threadId, in context);
 
         if (Interlocked.Increment(ref _guardViolationCount) <= 20)
-            Log($"guard violation: tid={threadId} rip=0x{context.Rip:X} ({Describe(context.Rip)})");
+            Log($"guard violation: tid={threadId} rip=0x{context.Rip:X} ({Describe(context.Rip)}) ours={ours}");
 
-        // Execute watches are one-shot: once the watched instruction has run, stop
-        // observing so we don't single-step the whole page afterwards.
-        if (_mode == AccessKind.Execute && ours)
+        // The OS has already cleared the guard bit for the page, so the faulting
+        // instruction can run now. Execute watches are one-shot; otherwise re-arm
+        // after a short delay (no trap flag) so the instruction finishes first.
+        if (_mode == AccessKind.Execute)
         {
-            Log("guard: execute hit recorded; guard disarmed (one-shot)");
+            Log("guard: execute watch disarmed (one-shot)");
             DisarmGuardPage();
-            return NativeMethods.DBG_CONTINUE;
         }
-
-        // Advance past the current instruction and re-arm. Guard execute faults are
-        // page-granular, so this single-steps code on the page until the watched
-        // instruction runs; cap it to avoid hanging a busy page.
-        if (_mode == AccessKind.Execute &&
-            Interlocked.Increment(ref _guardExecuteSteps) > MaxGuardExecuteSteps)
-        {
-            Log($"guard: execute cap reached ({MaxGuardExecuteSteps} single-steps); disarming");
-            DisarmGuardPage();
-            return NativeMethods.DBG_CONTINUE;
-        }
-
-        // The OS cleared the guard bit for the page, so the faulting instruction can
-        // run now. Single-step it and re-arm the guard afterwards.
-        if (TrySetTrapFlag(threadId, in context))
-            _pendingSingleStep[threadId] = 1;
         else
-            RearmGuardPage();
+        {
+            ScheduleRearmGuardPage();
+        }
 
         return NativeMethods.DBG_CONTINUE;
     }
 
-    private static bool TrySetTrapFlag(uint threadId, in NativeMethods.CONTEXT64 context)
+    private void ScheduleRearmGuardPage()
     {
-        return ModifyTrapFlag(threadId, in context, set: true);
-    }
+        if (Interlocked.Exchange(ref _rearmPending, 1) != 0)
+            return;
 
-    private static bool ClearTrapFlag(uint threadId)
-    {
-        if (!TryGetContext(threadId, NativeMethods.CONTEXT_CONTROL, out NativeMethods.CONTEXT64 context))
-            return false;
-        return ModifyTrapFlag(threadId, in context, set: false);
-    }
-
-    private static bool ModifyTrapFlag(uint threadId, in NativeMethods.CONTEXT64 context, bool set)
-    {
-        IntPtr raw = Marshal.AllocHGlobal(ContextSize + 16);
-        IntPtr aligned = (IntPtr)((raw.ToInt64() + 15) & ~15L);
-        IntPtr handle = NativeMethods.OpenThread(
-            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT,
-            false,
-            threadId);
-
-        try
+        ThreadPool.QueueUserWorkItem(_ =>
         {
-            if (handle == IntPtr.Zero)
-                return false;
-
-            NativeMethods.CONTEXT64 updated = context;
-            updated.ContextFlags = NativeMethods.CONTEXT_CONTROL;
-            updated.EFlags = set ? updated.EFlags | 0x100u : updated.EFlags & ~0x100u;
-
-            Marshal.StructureToPtr(updated, aligned, false);
-            return NativeMethods.SetThreadContext(handle, aligned);
-        }
-        finally
-        {
-            if (handle != IntPtr.Zero)
-                NativeMethods.CloseHandle(handle);
-            Marshal.FreeHGlobal(raw);
-        }
+            try
+            {
+                Thread.Sleep(GuardRearmDelayMs);
+                RearmGuardPage();
+            }
+            catch (Exception ex)
+            {
+                Log($"guard: delayed re-arm failed: {ex.Message}");
+            }
+            finally
+            {
+                Interlocked.Exchange(ref _rearmPending, 0);
+            }
+        });
     }
 
     private void ArmGuardPage()
@@ -698,7 +664,6 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
         }
 
         _guardArmed = true;
-        Interlocked.Exchange(ref _guardExecuteSteps, 0);
         Log($"guard: watching page 0x{pageBase:X} (protect=0x{mbi.Protect:X} + PAGE_GUARD) for 0x{_watchAddress:X}");
     }
 
@@ -722,10 +687,6 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
 
     private void DisarmGuardPage()
     {
-        foreach (uint threadId in _pendingSingleStep.Keys)
-            ClearTrapFlag(threadId);
-        _pendingSingleStep.Clear();
-
         if (!_guardArmed)
             return;
 
@@ -763,7 +724,7 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
 
     private sealed record ResolvedAccess(DisassembledInstruction Instruction, AccessKind Kind, ulong EffectiveAddress);
 
-    private bool IsOurAccess(uint threadId, in NativeMethods.CONTEXT64 context, out ResolvedAccess access)
+    private bool IsOurAccess(uint threadId, in TargetContext context, out ResolvedAccess access)
     {
         access = null!;
         ulong reported = context.Rip;
@@ -864,27 +825,50 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
         return fallback;
     }
 
-    private void RecordHit(in ResolvedAccess access, uint threadId)
+    private void RecordHit(in ResolvedAccess access, uint threadId, in TargetContext context)
     {
         DisassembledInstruction instruction = access.Instruction;
         AccessKind kind = access.Kind;
         ulong effectiveAddress = access.EffectiveAddress;
 
-        _hits.AddOrUpdate(
-            instruction.Address,
-            _ => new AccessHit(instruction.Address, threadId, kind, instruction.Text, instruction.Bytes, effectiveAddress),
-            (_, existing) =>
-            {
-                existing.Count++;
-                if (!string.IsNullOrEmpty(instruction.Text))
-                    existing.Disassembly = instruction.Text;
-                return existing;
-            });
+        if (!_hits.TryGetValue(instruction.Address, out AccessHit? hit))
+        {
+            hit = new AccessHit(instruction.Address, threadId, kind, instruction.Text, instruction.Bytes, effectiveAddress);
+            _hits[instruction.Address] = hit;
+        }
+        else
+        {
+            hit.Count++;
+            if (!string.IsNullOrEmpty(instruction.Text))
+                hit.Disassembly = instruction.Text;
+        }
+
+        byte[] valueBytes = ReadWatchedValue(effectiveAddress);
+        HitRecord record = HitRecord.Create(in context, _is32Bit, threadId, kind, effectiveAddress,
+            context.Rip, _valueType, valueBytes, DateTime.Now);
+        AppendRecord(hit, record);
 
         Log($"hit {kind} at 0x{instruction.Address:X} ({Describe(instruction.Address)}) " +
-            $"accessing 0x{effectiveAddress:X}: {instruction.Text}");
+            $"accessing 0x{effectiveAddress:X} value={record.ValueText}: {instruction.Text}");
 
         HitsChanged?.Invoke();
+    }
+
+    private byte[] ReadWatchedValue(ulong effectiveAddress)
+    {
+        ulong readAt = effectiveAddress != 0 ? effectiveAddress : _watchAddress;
+        return _memory.ReadBytes(readAt, _size) ?? Array.Empty<byte>();
+    }
+
+    private void AppendRecord(AccessHit hit, HitRecord record)
+    {
+        if (_ui is null)
+        {
+            hit.Records.Add(record);
+            return;
+        }
+
+        _ui.Post(_ => hit.Records.Add(record), null);
     }
 
     private void ArmThread(uint threadId)
@@ -896,10 +880,8 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
         if (_mechanism == AccessMechanism.GuardPage || !_setBreakpoints)
             return;
 
-        IntPtr raw = Marshal.AllocHGlobal(ContextSize + 16);
-        IntPtr aligned = (IntPtr)((raw.ToInt64() + 15) & ~15L);
         IntPtr handle = NativeMethods.OpenThread(
-            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT | NativeMethods.THREAD_SUSPEND_RESUME,
+            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT,
             false,
             threadId);
 
@@ -912,17 +894,12 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
                 return;
             }
 
-            var context = new NativeMethods.CONTEXT64 { ContextFlags = NativeMethods.CONTEXT_DEBUG_REGISTERS };
-            Marshal.StructureToPtr(context, aligned, false);
-
-            if (!NativeMethods.GetThreadContext(handle, aligned))
+            if (!TargetThreadContext.TryRead(handle, _is32Bit, ContextParts.DebugRegisters, out TargetContext context))
             {
                 Interlocked.Increment(ref _armFailCount);
                 Log($"GetThreadContext({threadId}) failed (err={Marshal.GetLastWin32Error()})");
                 return;
             }
-
-            context = Marshal.PtrToStructure<NativeMethods.CONTEXT64>(aligned);
 
             // Remember the thread's original debug registers so they can be restored.
             _saved[threadId] = new DebugRegisters(context.Dr0, context.Dr1, context.Dr2, context.Dr3, context.Dr7);
@@ -945,8 +922,7 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
 
             context.Dr7 = BuildDr7ForSlot(context.Dr7, slot);
 
-            Marshal.StructureToPtr(context, aligned, false);
-            bool set = NativeMethods.SetThreadContext(handle, aligned);
+            bool set = TargetThreadContext.TryWrite(handle, _is32Bit, in context, ContextParts.DebugRegisters);
 
             _threadSlots[threadId] = slot;
             Interlocked.Or(ref _usedSlotMask, 1 << slot);
@@ -963,9 +939,7 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
         }
         finally
         {
-            if (handle != IntPtr.Zero)
-                NativeMethods.CloseHandle(handle);
-            Marshal.FreeHGlobal(raw);
+            NativeMethods.CloseHandle(handle);
         }
     }
 
@@ -1012,32 +986,21 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
         return dr7;
     }
 
-    private static bool TryGetContext(uint threadId, uint flags, out NativeMethods.CONTEXT64 context)
+    private bool TryGetContext(uint threadId, ContextParts parts, out TargetContext context)
     {
         context = default;
-        IntPtr raw = Marshal.AllocHGlobal(ContextSize + 16);
-        IntPtr aligned = (IntPtr)((raw.ToInt64() + 15) & ~15L);
         IntPtr handle = NativeMethods.OpenThread(NativeMethods.THREAD_GET_CONTEXT, false, threadId);
+
+        if (handle == IntPtr.Zero)
+            return false;
 
         try
         {
-            if (handle == IntPtr.Zero)
-                return false;
-
-            var buffer = new NativeMethods.CONTEXT64 { ContextFlags = flags };
-            Marshal.StructureToPtr(buffer, aligned, false);
-
-            if (!NativeMethods.GetThreadContext(handle, aligned))
-                return false;
-
-            context = Marshal.PtrToStructure<NativeMethods.CONTEXT64>(aligned);
-            return true;
+            return TargetThreadContext.TryRead(handle, _is32Bit, parts, out context);
         }
         finally
         {
-            if (handle != IntPtr.Zero)
-                NativeMethods.CloseHandle(handle);
-            Marshal.FreeHGlobal(raw);
+            NativeMethods.CloseHandle(handle);
         }
     }
 
@@ -1046,13 +1009,23 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
         if (Interlocked.Exchange(ref _cleanupDone, 1) != 0)
             return;
 
+        Log($"cleanup: begin (mechanism={_mechanism}, restore={restoreRegisters})");
+
         // Clear our breakpoints while still attached. DebugActiveProcessStop can
         // restore the debuggee's saved context (re-applying DRs), so clear DRs again
         // afterwards as well. Guard-page watches are removed by restoring protection.
-        if (_mechanism == AccessMechanism.GuardPage)
-            DisarmGuardPage();
-        else
-            ClearAllThreads(restoreRegisters, "pre-detach");
+        // Each stage is isolated so one failure never skips detach.
+        try
+        {
+            if (_mechanism == AccessMechanism.GuardPage)
+                DisarmGuardPage();
+            else
+                ClearAllThreads(restoreRegisters, "pre-detach");
+        }
+        catch (Exception ex)
+        {
+            Log($"pre-detach cleanup failed: {ex.Message}");
+        }
 
         try
         {
@@ -1064,12 +1037,20 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
             Log($"failed to detach debugger: {ex.Message}");
         }
 
-        if (_mechanism == AccessMechanism.GuardPage)
-            DisarmGuardPage();
-        else
-            ClearAllThreads(restoreRegisters: false, "post-detach");
+        try
+        {
+            if (_mechanism == AccessMechanism.GuardPage)
+                DisarmGuardPage();
+            else
+                ClearAllThreads(restoreRegisters: false, "post-detach");
+        }
+        catch (Exception ex)
+        {
+            Log($"post-detach cleanup failed: {ex.Message}");
+        }
 
         _attached = false;
+        Log("cleanup: done");
     }
 
     private void ClearAllThreads(bool restoreRegisters, string phase)
@@ -1105,58 +1086,40 @@ internal sealed class HardwareBreakpointTracker : IAccessTracker, IDisposable
 
     private void ApplyDebugRegisters(uint threadId, DebugRegisters desired, string phase)
     {
-        IntPtr raw = Marshal.AllocHGlobal(ContextSize + 16);
-        IntPtr aligned = (IntPtr)((raw.ToInt64() + 15) & ~15L);
+        // No explicit suspension (see ArmThread): suspending a foreign thread can
+        // deadlock the kernel.
         IntPtr handle = NativeMethods.OpenThread(
-            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT | NativeMethods.THREAD_SUSPEND_RESUME,
+            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT,
             false,
             threadId);
 
+        if (handle == IntPtr.Zero)
+            return;
+
         try
         {
-            if (handle == IntPtr.Zero)
+            if (!TargetThreadContext.TryRead(handle, _is32Bit, ContextParts.DebugRegisters, out TargetContext context))
                 return;
 
-            if (NativeMethods.SuspendThread(handle) == unchecked((uint)-1))
-                return;
+            context.Dr0 = desired.Dr0;
+            context.Dr1 = desired.Dr1;
+            context.Dr2 = desired.Dr2;
+            context.Dr3 = desired.Dr3;
+            context.Dr7 = desired.Dr7;
+            TargetThreadContext.TryWrite(handle, _is32Bit, in context, ContextParts.DebugRegisters);
 
-            try
+            if (TargetThreadContext.TryRead(handle, _is32Bit, ContextParts.DebugRegisters, out TargetContext verify))
             {
-                var context = new NativeMethods.CONTEXT64 { ContextFlags = NativeMethods.CONTEXT_DEBUG_REGISTERS };
-                Marshal.StructureToPtr(context, aligned, false);
-
-                if (!NativeMethods.GetThreadContext(handle, aligned))
-                    return;
-
-                context = Marshal.PtrToStructure<NativeMethods.CONTEXT64>(aligned);
-                context.Dr0 = desired.Dr0;
-                context.Dr1 = desired.Dr1;
-                context.Dr2 = desired.Dr2;
-                context.Dr3 = desired.Dr3;
-                context.Dr7 = desired.Dr7;
-                Marshal.StructureToPtr(context, aligned, false);
-                NativeMethods.SetThreadContext(handle, aligned);
-
-                if (NativeMethods.GetThreadContext(handle, aligned))
+                if (verify.Dr7 != desired.Dr7 || verify.Dr0 != desired.Dr0 || verify.Dr1 != desired.Dr1 ||
+                    verify.Dr2 != desired.Dr2 || verify.Dr3 != desired.Dr3)
                 {
-                    var verify = Marshal.PtrToStructure<NativeMethods.CONTEXT64>(aligned);
-                    if (verify.Dr7 != desired.Dr7 || verify.Dr0 != desired.Dr0 || verify.Dr1 != desired.Dr1 ||
-                        verify.Dr2 != desired.Dr2 || verify.Dr3 != desired.Dr3)
-                    {
-                        Log($"[{phase}] tid={threadId} DR mismatch: want dr7=0x{desired.Dr7:X} got 0x{verify.Dr7:X}");
-                    }
+                    Log($"[{phase}] tid={threadId} DR mismatch: want dr7=0x{desired.Dr7:X} got 0x{verify.Dr7:X}");
                 }
-            }
-            finally
-            {
-                NativeMethods.ResumeThread(handle);
             }
         }
         finally
         {
-            if (handle != IntPtr.Zero)
-                NativeMethods.CloseHandle(handle);
-            Marshal.FreeHGlobal(raw);
+            NativeMethods.CloseHandle(handle);
         }
     }
 

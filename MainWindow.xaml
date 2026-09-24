@@ -44,6 +44,7 @@
             </MenuItem>
             <MenuItem Header="_Windows">
                 <MenuItem Header="Code browser..." Click="CodeBrowserMenuItem_Click" />
+                <MenuItem Header="Structure browser..." Click="StructureBrowserMenuItem_Click" />
             </MenuItem>
             <MenuItem Header="_Diagnostics">
                 <MenuItem Header="Attach only (no breakpoints)" Click="ProbeAttachOnly_Click" />

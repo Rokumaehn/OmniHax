@@ -23,6 +23,7 @@ public partial class AccessTrackerWindow : Window
     private readonly ProbeMode _probeMode;
     private readonly AccessMechanism _mechanism;
     private readonly Action<ulong, string>? _registerScript;
+    private readonly MemoryValueType? _valueType;
     private readonly ObservableCollection<AccessHit> _items = new();
 
     private IAccessTracker? _tracker;
@@ -31,7 +32,7 @@ public partial class AccessTrackerWindow : Window
     internal AccessTrackerWindow(ProcessMemory memory, DisassemblyService disassembly, AssemblerService assembler,
         ulong address, AccessKind mode, int size, ProbeMode probeMode = ProbeMode.Normal,
         AccessMechanism mechanism = AccessMechanism.HardwareBreakpoints,
-        Action<ulong, string>? registerScript = null)
+        Action<ulong, string>? registerScript = null, MemoryValueType? valueType = null)
     {
         InitializeComponent();
 
@@ -44,6 +45,7 @@ public partial class AccessTrackerWindow : Window
         _probeMode = probeMode;
         _mechanism = mechanism;
         _registerScript = registerScript;
+        _valueType = valueType;
 
         HitsGrid.ItemsSource = _items;
 
@@ -100,8 +102,8 @@ public partial class AccessTrackerWindow : Window
                 ProbeMode.DecoyGuard => new DecoyProbe(_memory, DecoyKind.Guard),
                 ProbeMode.DecoyDr => new DecoyProbe(_memory, DecoyKind.Dr),
                 _ when _mechanism == AccessMechanism.InProcessVeh =>
-                    new InProcessBreakpointTracker(_memory, _disassembly, _address, watchSize, _mode),
-                _ => new HardwareBreakpointTracker(_memory, _disassembly, _address, _mode, watchSize, mechanism: _mechanism)
+                    new InProcessBreakpointTracker(_memory, _disassembly, _address, watchSize, _mode, _valueType),
+                _ => new HardwareBreakpointTracker(_memory, _disassembly, _address, _mode, watchSize, mechanism: _mechanism, valueType: _valueType)
             };
 
             _tracker.Start();
@@ -229,6 +231,16 @@ public partial class AccessTrackerWindow : Window
 
     private void HitsGrid_MouseDoubleClick(object sender, MouseButtonEventArgs e)
     {
+        // MouseDoubleClick is a Direct event, so the nested records grid raises its
+        // own instance too. Bail out if this double-click came from that grid; its
+        // handler opens the register window instead.
+        DependencyObject? source = e.OriginalSource as DependencyObject;
+        while (source is not null and not DataGrid)
+            source = VisualTreeHelper.GetParent(source);
+
+        if (source is not null && !ReferenceEquals(source, HitsGrid))
+            return;
+
         if (HitsGrid.SelectedItem is not AccessHit hit)
             return;
 
@@ -237,6 +249,30 @@ public partial class AccessTrackerWindow : Window
             Owner = this
         };
         browser.Show();
+    }
+
+    private void HitToggle_PreviewMouseLeftButtonDown(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is System.Windows.Controls.Primitives.ToggleButton { DataContext: AccessHit hit })
+        {
+            hit.IsExpanded = !hit.IsExpanded;
+            e.Handled = true;
+        }
+    }
+
+    private void RecordsGrid_MouseDoubleClick(object sender, MouseButtonEventArgs e)
+    {
+        if (sender is not DataGrid grid || grid.SelectedItem is not HitRecord record)
+            return;
+
+        e.Handled = true;
+
+        AccessHit? owner = _items.FirstOrDefault(h => h.Records.Contains(record));
+        var window = new HitDetailsWindow(record, owner?.Disassembly ?? string.Empty, owner?.AddressText ?? string.Empty)
+        {
+            Owner = this
+        };
+        window.Show();
     }
 
     private void HitsGrid_PreviewMouseRightButtonDown(object sender, MouseButtonEventArgs e)

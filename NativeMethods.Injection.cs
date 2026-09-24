@@ -31,6 +31,14 @@ internal static partial class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     public static extern bool EnumProcessModules(IntPtr hProcess, [Out] IntPtr[] lphModule, uint cb, out uint lpcbNeeded);
 
+    public const uint LIST_MODULES_32BIT = 0x01;
+    public const uint LIST_MODULES_64BIT = 0x02;
+    public const uint LIST_MODULES_ALL = 0x03;
+
+    [DllImport("psapi.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    public static extern bool EnumProcessModulesEx(IntPtr hProcess, [Out] IntPtr[] lphModule, uint cb, out uint lpcbNeeded, uint dwFilterFlag);
+
     [DllImport("psapi.dll", CharSet = CharSet.Unicode, SetLastError = true)]
     public static extern uint GetModuleBaseName(IntPtr hProcess, IntPtr hModule, StringBuilder lpBaseName, uint nSize);
 

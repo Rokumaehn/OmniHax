@@ -1,6 +1,5 @@
 using System.Collections.Concurrent;
 using System.Runtime.InteropServices;
-using System.Text;
 
 namespace OmniHax;
 
@@ -12,13 +11,15 @@ namespace OmniHax;
 /// </summary>
 internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
 {
-    private const int ContextSize = 1232;
-
     private readonly ProcessMemory _memory;
     private readonly DisassemblyService _disassembly;
     private readonly ulong _watchAddress;
     private readonly int _size;
     private readonly AccessKind _mode;
+    private readonly bool _is32Bit;
+    private readonly AgentLayout _layout;
+    private readonly MemoryValueType? _valueType;
+    private SynchronizationContext? _ui;
     private readonly ConcurrentQueue<string> _log = new();
     private readonly ConcurrentDictionary<ulong, AccessHit> _hits = new();
     private readonly ConcurrentDictionary<uint, DebugRegisters> _armed = new();
@@ -35,11 +36,14 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
     private int _hitLogCount;
 
     public InProcessBreakpointTracker(ProcessMemory memory, DisassemblyService disassembly, ulong address, int size,
-        AccessKind mode = AccessKind.Write)
+        AccessKind mode = AccessKind.Write, MemoryValueType? valueType = null)
     {
         _memory = memory;
         _disassembly = disassembly;
         _mode = mode;
+        _is32Bit = !memory.Is64BitProcess;
+        _layout = _is32Bit ? AgentLayout.X86 : AgentLayout.X64;
+        _valueType = valueType;
 
         if (mode == AccessKind.Execute)
         {
@@ -70,8 +74,8 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
 
         // Skip any records already queued so they don't repopulate the list.
         var index = new byte[8];
-        if (_codeBase != 0 && _memory.ReadBytes(_codeBase + ShellcodeAgent.WriteIndexOffset, index, 8, out _))
-            Interlocked.Exchange(ref _readCursor, (long)BitConverter.ToUInt64(index, 0));
+        if (_codeBase != 0 && _memory.ReadBytes(_codeBase + (ulong)_layout.WriteIndexOffset, index, _layout.PointerSize, out _))
+            Interlocked.Exchange(ref _readCursor, (long)ReadCounter(index));
     }
 
     public IReadOnlyList<string> DrainLog()
@@ -95,26 +99,27 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
         if (_running)
             return;
 
-        if (!_memory.Is64BitProcess)
-            throw new NotSupportedException("Access tracking is only supported for 64-bit target processes.");
+        TargetGuard.Verify(_memory);
+        _ui = SynchronizationContext.Current;
+        Log($"in-process VEH: start: target verified (pid={_memory.ProcessId} {_memory.ProcessName})");
 
         LoadModules();
 
-        Log("in-process VEH: resolving exports");
-        ulong addVeh = ResolveExportToTarget(_memory, "kernel32.dll", "AddVectoredExceptionHandler");
-        ulong getTid = ResolveExportToTarget(_memory, "kernel32.dll", "GetCurrentThreadId");
-        ulong removeVeh = ResolveExportToTarget(_memory, "kernel32.dll", "RemoveVectoredExceptionHandler");
+        Log($"in-process VEH: resolving exports ({( _is32Bit ? "x86" : "x64")})");
+        ulong addVeh = ResolveExport("kernel32.dll", "AddVectoredExceptionHandler");
+        ulong getTid = ResolveExport("kernel32.dll", "GetCurrentThreadId");
+        ulong removeVeh = ResolveExport("kernel32.dll", "RemoveVectoredExceptionHandler");
         Log($"in-process VEH: AddVectoredExceptionHandler=0x{addVeh:X} GetCurrentThreadId=0x{getTid:X} RemoveVectoredExceptionHandler=0x{removeVeh:X}");
 
         IntPtr code = NativeMethods.VirtualAllocEx(
-            _memory.Handle, IntPtr.Zero, (IntPtr)ShellcodeAgent.CodeSize,
+            _memory.Handle, IntPtr.Zero, (IntPtr)_layout.CodeSize,
             NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE, NativeMethods.PAGE_EXECUTE_READWRITE);
         if (code == IntPtr.Zero)
             throw new InvalidOperationException($"VirtualAllocEx(code) failed (err={Marshal.GetLastWin32Error()}).");
         _codeBase = unchecked((ulong)code.ToInt64());
 
         IntPtr entries = NativeMethods.VirtualAllocEx(
-            _memory.Handle, IntPtr.Zero, (IntPtr)(ShellcodeAgent.Capacity * ShellcodeAgent.EntrySize),
+            _memory.Handle, IntPtr.Zero, (IntPtr)(_layout.Capacity * _layout.EntrySize),
             NativeMethods.MEM_COMMIT | NativeMethods.MEM_RESERVE, NativeMethods.PAGE_READWRITE);
         if (entries == IntPtr.Zero)
         {
@@ -124,7 +129,7 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
         _entriesBase = unchecked((ulong)entries.ToInt64());
         Log($"in-process VEH: code=0x{_codeBase:X} entries=0x{_entriesBase:X}");
 
-        byte[] blob = ShellcodeAgent.Build(_codeBase, addVeh, getTid, removeVeh, _entriesBase);
+        byte[] blob = ShellcodeAgent.Build(_layout, _codeBase, addVeh, getTid, removeVeh, _entriesBase);
         if (!_memory.WriteBytes(_codeBase, blob))
         {
             NativeMethods.VirtualFreeEx(_memory.Handle, code, IntPtr.Zero, NativeMethods.MEM_RELEASE);
@@ -135,7 +140,7 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
 
         IntPtr thread = NativeMethods.CreateRemoteThread(
             _memory.Handle, IntPtr.Zero, IntPtr.Zero,
-            unchecked((IntPtr)(long)(_codeBase + ShellcodeAgent.StubOffset)), IntPtr.Zero, 0, out _);
+            unchecked((IntPtr)(long)(_codeBase + (ulong)_layout.StubOffset)), IntPtr.Zero, 0, out _);
 
         if (thread == IntPtr.Zero)
             throw new InvalidOperationException($"CreateRemoteThread failed (err={Marshal.GetLastWin32Error()}).");
@@ -199,25 +204,25 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
     private void Drain()
     {
         var index = new byte[8];
-        if (!_memory.ReadBytes(_codeBase + ShellcodeAgent.WriteIndexOffset, index, 8, out _))
+        if (!_memory.ReadBytes(_codeBase + (ulong)_layout.WriteIndexOffset, index, _layout.PointerSize, out _))
             return;
 
-        ulong writeIndex = BitConverter.ToUInt64(index, 0);
+        ulong writeIndex = ReadCounter(index);
         long cursor = Interlocked.Read(ref _readCursor);
 
-        if (writeIndex - (ulong)cursor > ShellcodeAgent.Capacity)
-            cursor = (long)(writeIndex - ShellcodeAgent.Capacity);
+        if (writeIndex - (ulong)cursor > (ulong)_layout.Capacity)
+            cursor = (long)(writeIndex - (ulong)_layout.Capacity);
 
-        var entry = new byte[ShellcodeAgent.EntrySize];
+        var entry = new byte[_layout.EntrySize];
 
         while ((ulong)cursor < writeIndex)
         {
-            ulong slot = (ulong)cursor & (ShellcodeAgent.Capacity - 1);
-            if (_memory.ReadBytes(_entriesBase + slot * ShellcodeAgent.EntrySize, entry, ShellcodeAgent.EntrySize, out _))
+            ulong slot = (ulong)cursor & (ulong)(_layout.Capacity - 1);
+            if (_memory.ReadBytes(_entriesBase + slot * (ulong)_layout.EntrySize, entry, _layout.EntrySize, out _))
             {
-                ulong rip = BitConverter.ToUInt64(entry, 0);
-                uint tid = BitConverter.ToUInt32(entry, 8);
-                NativeMethods.CONTEXT64 context = BuildContext(entry, rip);
+                ulong rip = ReadInstructionPointer(entry);
+                uint tid = BitConverter.ToUInt32(entry, _layout.PointerSize);
+                TargetContext context = BuildContext(entry, rip);
                 ProcessHit(rip, tid, in context);
             }
 
@@ -227,9 +232,15 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
         Interlocked.Exchange(ref _readCursor, cursor);
     }
 
+    private ulong ReadCounter(byte[] buffer) =>
+        _layout.PointerSize == 8 ? BitConverter.ToUInt64(buffer, 0) : BitConverter.ToUInt32(buffer, 0);
+
+    private ulong ReadInstructionPointer(byte[] entry) =>
+        _layout.PointerSize == 8 ? BitConverter.ToUInt64(entry, 0) : BitConverter.ToUInt32(entry, 0);
+
     private sealed record ResolvedAccess(DisassembledInstruction Instruction, AccessKind Kind, ulong EffectiveAddress);
 
-    private void ProcessHit(ulong reportedRip, uint tid, in NativeMethods.CONTEXT64 context)
+    private void ProcessHit(ulong reportedRip, uint tid, in TargetContext context)
     {
         ResolvedAccess? resolved = ResolveAccess(reportedRip, in context);
         DisassembledInstruction? decoded = resolved?.Instruction;
@@ -239,23 +250,39 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
         string text = decoded?.Text ?? string.Empty;
         byte[] bytes = decoded?.Bytes ?? Array.Empty<byte>();
 
-        _hits.AddOrUpdate(
-            instructionAddress,
-            _ =>
-            {
-                if (Interlocked.Increment(ref _hitLogCount) <= 50)
-                    Log($"hit {kind} at 0x{instructionAddress:X} ({Describe(instructionAddress)}) tid={tid} eff=0x{effectiveAddress:X}: {text}");
+        if (!_hits.TryGetValue(instructionAddress, out AccessHit? hit))
+        {
+            hit = new AccessHit(instructionAddress, tid, kind, text, bytes, effectiveAddress);
+            _hits[instructionAddress] = hit;
 
-                HitsChanged?.Invoke();
-                return new AccessHit(instructionAddress, tid, kind, text, bytes, effectiveAddress);
-            },
-            (_, existing) =>
-            {
-                existing.Count++;
-                if (!string.IsNullOrEmpty(text))
-                    existing.Disassembly = text;
-                return existing;
-            });
+            if (Interlocked.Increment(ref _hitLogCount) <= 50)
+                Log($"hit {kind} at 0x{instructionAddress:X} ({Describe(instructionAddress)}) tid={tid} eff=0x{effectiveAddress:X}: {text}");
+
+            HitsChanged?.Invoke();
+        }
+        else
+        {
+            hit.Count++;
+            if (!string.IsNullOrEmpty(text))
+                hit.Disassembly = text;
+        }
+
+        ulong readAt = effectiveAddress != 0 ? effectiveAddress : _watchAddress;
+        byte[] valueBytes = _memory.ReadBytes(readAt, _size) ?? Array.Empty<byte>();
+        HitRecord record = HitRecord.Create(in context, _is32Bit, tid, kind, effectiveAddress, reportedRip,
+            _valueType, valueBytes, DateTime.Now);
+        AppendRecord(hit, record);
+    }
+
+    private void AppendRecord(AccessHit hit, HitRecord record)
+    {
+        if (_ui is null)
+        {
+            hit.Records.Add(record);
+            return;
+        }
+
+        _ui.Post(_ => hit.Records.Add(record), null);
     }
 
     /// <summary>
@@ -264,7 +291,7 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
     /// address (using the captured registers). Execute breakpoints fault at the
     /// instruction, so decode forward at the RIP.
     /// </summary>
-    private ResolvedAccess? ResolveAccess(ulong reportedRip, in NativeMethods.CONTEXT64 context)
+    private ResolvedAccess? ResolveAccess(ulong reportedRip, in TargetContext context)
     {
         if (_mode == AccessKind.Execute)
         {
@@ -349,28 +376,90 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
         return AccessKind.Write;
     }
 
-    private static NativeMethods.CONTEXT64 BuildContext(byte[] entry, ulong rip)
+    private TargetContext BuildContext(byte[] entry, ulong rip)
     {
-        return new NativeMethods.CONTEXT64
+        if (_layout.PointerSize == 8)
         {
-            Rax = BitConverter.ToUInt64(entry, 16),
-            Rcx = BitConverter.ToUInt64(entry, 24),
-            Rdx = BitConverter.ToUInt64(entry, 32),
-            Rbx = BitConverter.ToUInt64(entry, 40),
-            Rsp = BitConverter.ToUInt64(entry, 48),
-            Rbp = BitConverter.ToUInt64(entry, 56),
-            Rsi = BitConverter.ToUInt64(entry, 64),
-            Rdi = BitConverter.ToUInt64(entry, 72),
-            R8 = BitConverter.ToUInt64(entry, 80),
-            R9 = BitConverter.ToUInt64(entry, 88),
-            R10 = BitConverter.ToUInt64(entry, 96),
-            R11 = BitConverter.ToUInt64(entry, 104),
-            R12 = BitConverter.ToUInt64(entry, 112),
-            R13 = BitConverter.ToUInt64(entry, 120),
-            R14 = BitConverter.ToUInt64(entry, 128),
-            R15 = BitConverter.ToUInt64(entry, 136),
-            Rip = rip
-        };
+            var context = new TargetContext
+            {
+                Rip = rip,
+                EFlags = BitConverter.ToUInt32(entry, ShellcodeAgent.X64SegEflagsOffset + 12),
+                SegCs = BitConverter.ToUInt16(entry, ShellcodeAgent.X64SegEflagsOffset + 0),
+                SegDs = BitConverter.ToUInt16(entry, ShellcodeAgent.X64SegEflagsOffset + 2),
+                SegEs = BitConverter.ToUInt16(entry, ShellcodeAgent.X64SegEflagsOffset + 4),
+                SegFs = BitConverter.ToUInt16(entry, ShellcodeAgent.X64SegEflagsOffset + 6),
+                SegGs = BitConverter.ToUInt16(entry, ShellcodeAgent.X64SegEflagsOffset + 8),
+                SegSs = BitConverter.ToUInt16(entry, ShellcodeAgent.X64SegEflagsOffset + 10),
+                Rax = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 0),
+                Rcx = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 8),
+                Rdx = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 16),
+                Rbx = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 24),
+                Rsp = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 32),
+                Rbp = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 40),
+                Rsi = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 48),
+                Rdi = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 56),
+                R8 = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 64),
+                R9 = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 72),
+                R10 = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 80),
+                R11 = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 88),
+                R12 = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 96),
+                R13 = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 104),
+                R14 = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 112),
+                R15 = BitConverter.ToUInt64(entry, ShellcodeAgent.X64GprOffset + 120)
+            };
+
+            int flt = ShellcodeAgent.X64FltSaveOffset;
+            context.FpuControlWord = BitConverter.ToUInt16(entry, flt + 0);
+            context.FpuStatusWord = BitConverter.ToUInt16(entry, flt + 2);
+            context.FpuTagWord = entry[flt + 4];
+            context.MxCsr = BitConverter.ToUInt32(entry, flt + 0x18);
+
+            var fpu = new byte[80];
+            for (int i = 0; i < 8; i++)
+                Array.Copy(entry, flt + 0x20 + i * 16, fpu, i * 10, 10);
+            context.FpuRegisters = fpu;
+
+            var xmm = new byte[256];
+            Array.Copy(entry, flt + 0xA0, xmm, 0, 256);
+            context.XmmRegisters = xmm;
+
+            return context;
+        }
+        else
+        {
+            var context = new TargetContext
+            {
+                Rip = rip,
+                EFlags = BitConverter.ToUInt32(entry, ShellcodeAgent.X86EFlagsOffset),
+                SegGs = (ushort)BitConverter.ToUInt32(entry, ShellcodeAgent.X86SegOffset + 0),
+                SegFs = (ushort)BitConverter.ToUInt32(entry, ShellcodeAgent.X86SegOffset + 4),
+                SegEs = (ushort)BitConverter.ToUInt32(entry, ShellcodeAgent.X86SegOffset + 8),
+                SegDs = (ushort)BitConverter.ToUInt32(entry, ShellcodeAgent.X86SegOffset + 12),
+                SegCs = (ushort)BitConverter.ToUInt32(entry, ShellcodeAgent.X86SegOffset + 16),
+                SegSs = (ushort)BitConverter.ToUInt32(entry, ShellcodeAgent.X86SegOffset + 20),
+                Rax = BitConverter.ToUInt32(entry, ShellcodeAgent.X86GprOffset + 0),
+                Rcx = BitConverter.ToUInt32(entry, ShellcodeAgent.X86GprOffset + 4),
+                Rdx = BitConverter.ToUInt32(entry, ShellcodeAgent.X86GprOffset + 8),
+                Rbx = BitConverter.ToUInt32(entry, ShellcodeAgent.X86GprOffset + 12),
+                Rsp = BitConverter.ToUInt32(entry, ShellcodeAgent.X86GprOffset + 16),
+                Rbp = BitConverter.ToUInt32(entry, ShellcodeAgent.X86GprOffset + 20),
+                Rsi = BitConverter.ToUInt32(entry, ShellcodeAgent.X86GprOffset + 24),
+                Rdi = BitConverter.ToUInt32(entry, ShellcodeAgent.X86GprOffset + 28),
+                FpuControlWord = BitConverter.ToUInt16(entry, ShellcodeAgent.X86FpuCtrlOffset),
+                FpuStatusWord = BitConverter.ToUInt16(entry, ShellcodeAgent.X86FpuStatusOffset),
+                FpuTagWord = (ushort)BitConverter.ToUInt32(entry, ShellcodeAgent.X86FpuTagOffset)
+            };
+
+            var fpu = new byte[80];
+            Array.Copy(entry, ShellcodeAgent.X86X87Offset, fpu, 0, 80);
+            context.FpuRegisters = fpu;
+
+            var xmm = new byte[128];
+            Array.Copy(entry, ShellcodeAgent.X86XmmOffset, xmm, 0, 128);
+            context.XmmRegisters = xmm;
+
+            return context;
+        }
     }
 
     private static int ScoreAccess(in Iced.Intel.Instruction instruction)
@@ -411,7 +500,7 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
     {
         try
         {
-            foreach ((string name, ulong b, ulong size) in EnumerateModules(_memory.Handle))
+            foreach ((string name, ulong b, ulong size) in TargetModules.Enumerate(_memory.Handle))
                 _modules.Add((b, b + size, name));
 
             _modules.Sort((a, b) => a.Base.CompareTo(b.Base));
@@ -473,69 +562,53 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
 
     private void ArmThread(uint threadId)
     {
-        IntPtr raw = Marshal.AllocHGlobal(ContextSize + 16);
-        IntPtr aligned = (IntPtr)((raw.ToInt64() + 15) & ~15L);
+        // No explicit suspension: parking a thread that holds a kernel lock can
+        // deadlock the system (CLOCK_WATCHDOG_TIMEOUT). The context APIs do their
+        // own kernel-safe synchronization.
         IntPtr handle = NativeMethods.OpenThread(
-            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT | NativeMethods.THREAD_SUSPEND_RESUME,
+            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT,
             false,
             threadId);
 
+        if (handle == IntPtr.Zero)
+        {
+            Log($"in-process VEH: OpenThread({threadId}) failed (err={Marshal.GetLastWin32Error()})");
+            return;
+        }
+
         try
         {
-            if (handle == IntPtr.Zero)
+            if (!TargetThreadContext.TryRead(handle, _is32Bit, ContextParts.DebugRegisters, out TargetContext context))
             {
-                Log($"in-process VEH: OpenThread({threadId}) failed (err={Marshal.GetLastWin32Error()})");
+                Log($"in-process VEH: GetThreadContext({threadId}) failed (err={Marshal.GetLastWin32Error()})");
                 return;
             }
 
-            if (NativeMethods.SuspendThread(handle) == unchecked((uint)-1))
+            _armed[threadId] = new DebugRegisters(context.Dr0, context.Dr1, context.Dr2, context.Dr3, context.Dr7);
+
+            int slot = FindFreeSlot(context.Dr7);
+            if (slot < 0)
+            {
+                Log($"in-process VEH: thread {threadId} has no free DR slot");
                 return;
-
-            try
-            {
-                var context = new NativeMethods.CONTEXT64 { ContextFlags = NativeMethods.CONTEXT_DEBUG_REGISTERS };
-                Marshal.StructureToPtr(context, aligned, false);
-
-                if (!NativeMethods.GetThreadContext(handle, aligned))
-                {
-                    Log($"in-process VEH: GetThreadContext({threadId}) failed (err={Marshal.GetLastWin32Error()})");
-                    return;
-                }
-
-                context = Marshal.PtrToStructure<NativeMethods.CONTEXT64>(aligned);
-                _armed[threadId] = new DebugRegisters(context.Dr0, context.Dr1, context.Dr2, context.Dr3, context.Dr7);
-
-                int slot = FindFreeSlot(context.Dr7);
-                if (slot < 0)
-                {
-                    Log($"in-process VEH: thread {threadId} has no free DR slot");
-                    return;
-                }
-
-                switch (slot)
-                {
-                    case 0: context.Dr0 = _watchAddress; break;
-                    case 1: context.Dr1 = _watchAddress; break;
-                    case 2: context.Dr2 = _watchAddress; break;
-                    default: context.Dr3 = _watchAddress; break;
-                }
-
-                context.Dr7 = BuildDr7(context.Dr7, slot);
-
-                Marshal.StructureToPtr(context, aligned, false);
-                if (!NativeMethods.SetThreadContext(handle, aligned))
-                    Log($"in-process VEH: SetThreadContext({threadId}) failed (err={Marshal.GetLastWin32Error()})");
             }
-            finally
+
+            switch (slot)
             {
-                NativeMethods.ResumeThread(handle);
+                case 0: context.Dr0 = _watchAddress; break;
+                case 1: context.Dr1 = _watchAddress; break;
+                case 2: context.Dr2 = _watchAddress; break;
+                default: context.Dr3 = _watchAddress; break;
             }
+
+            context.Dr7 = BuildDr7(context.Dr7, slot);
+
+            if (!TargetThreadContext.TryWrite(handle, _is32Bit, in context, ContextParts.DebugRegisters))
+                Log($"in-process VEH: SetThreadContext({threadId}) failed (err={Marshal.GetLastWin32Error()})");
         }
         finally
         {
-            if (handle != IntPtr.Zero)
-                NativeMethods.CloseHandle(handle);
-            Marshal.FreeHGlobal(raw);
+            NativeMethods.CloseHandle(handle);
         }
     }
 
@@ -605,10 +678,29 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
             }
         }
 
-        RestoreAllThreads();
-        Log("in-process VEH: cleared debug registers");
+        Log("in-process VEH: cleanup: restoring debug registers");
+        try
+        {
+            RestoreAllThreads();
+            Log("in-process VEH: cleared debug registers");
+        }
+        catch (Exception ex)
+        {
+            Log($"in-process VEH: restore failed: {ex.Message}");
+        }
 
-        TeardownAgent();
+        try
+        {
+            TeardownAgent();
+        }
+        catch (Exception ex)
+        {
+            Log($"in-process VEH: teardown failed: {ex.Message}");
+        }
+        finally
+        {
+            Log("in-process VEH: cleanup done");
+        }
 
         _cts?.Dispose();
         _cts = null;
@@ -635,8 +727,8 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
             }
 
             var handleBuffer = new byte[8];
-            ulong vehHandle = _memory.ReadBytes(codeBase + ShellcodeAgent.VehHandleOffset, handleBuffer, 8, out _)
-                ? BitConverter.ToUInt64(handleBuffer, 0)
+            ulong vehHandle = _memory.ReadBytes(codeBase + (ulong)_layout.VehHandleOffset, handleBuffer, _layout.PointerSize, out _)
+                ? ReadCounter(handleBuffer)
                 : 0;
 
             bool removed = vehHandle == 0;
@@ -645,7 +737,7 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
             {
                 IntPtr thread = NativeMethods.CreateRemoteThread(
                     _memory.Handle, IntPtr.Zero, IntPtr.Zero,
-                    unchecked((IntPtr)(long)(codeBase + ShellcodeAgent.TeardownStubOffset)), IntPtr.Zero, 0, out _);
+                    unchecked((IntPtr)(long)(codeBase + (ulong)_layout.TeardownStubOffset)), IntPtr.Zero, 0, out _);
 
                 if (thread != IntPtr.Zero)
                 {
@@ -690,126 +782,39 @@ internal sealed class InProcessBreakpointTracker : IAccessTracker, IDisposable
 
     private void RestoreThread(uint threadId, DebugRegisters original)
     {
-        IntPtr raw = Marshal.AllocHGlobal(ContextSize + 16);
-        IntPtr aligned = (IntPtr)((raw.ToInt64() + 15) & ~15L);
         IntPtr handle = NativeMethods.OpenThread(
-            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT | NativeMethods.THREAD_SUSPEND_RESUME,
+            NativeMethods.THREAD_GET_CONTEXT | NativeMethods.THREAD_SET_CONTEXT,
             false,
             threadId);
 
+        if (handle == IntPtr.Zero)
+            return;
+
         try
         {
-            if (handle == IntPtr.Zero)
-                return;
-
-            if (NativeMethods.SuspendThread(handle) == unchecked((uint)-1))
-                return;
-
-            try
+            if (TargetThreadContext.TryRead(handle, _is32Bit, ContextParts.DebugRegisters, out TargetContext context))
             {
-                var context = new NativeMethods.CONTEXT64 { ContextFlags = NativeMethods.CONTEXT_DEBUG_REGISTERS };
-                Marshal.StructureToPtr(context, aligned, false);
-
-                if (NativeMethods.GetThreadContext(handle, aligned))
-                {
-                    context = Marshal.PtrToStructure<NativeMethods.CONTEXT64>(aligned);
-                    context.Dr0 = original.Dr0;
-                    context.Dr1 = original.Dr1;
-                    context.Dr2 = original.Dr2;
-                    context.Dr3 = original.Dr3;
-                    context.Dr7 = original.Dr7;
-                    Marshal.StructureToPtr(context, aligned, false);
-                    NativeMethods.SetThreadContext(handle, aligned);
-                }
-            }
-            finally
-            {
-                NativeMethods.ResumeThread(handle);
+                context.Dr0 = original.Dr0;
+                context.Dr1 = original.Dr1;
+                context.Dr2 = original.Dr2;
+                context.Dr3 = original.Dr3;
+                context.Dr7 = original.Dr7;
+                TargetThreadContext.TryWrite(handle, _is32Bit, in context, ContextParts.DebugRegisters);
             }
         }
         finally
         {
-            if (handle != IntPtr.Zero)
-                NativeMethods.CloseHandle(handle);
-            Marshal.FreeHGlobal(raw);
+            NativeMethods.CloseHandle(handle);
         }
     }
 
-    private ulong ResolveExportToTarget(ProcessMemory target, string dllName, string funcName)
+    private ulong ResolveExport(string dllName, string funcName)
     {
-        IntPtr module = NativeMethods.GetModuleHandle(dllName);
-        if (module == IntPtr.Zero)
-            throw new InvalidOperationException($"GetModuleHandle({dllName}) failed.");
+        if (!PeExports.TryResolve(_memory, dllName, funcName, out ulong address))
+            throw new InvalidOperationException($"Could not resolve {dllName}!{funcName} in the target process.");
 
-        IntPtr function = NativeMethods.GetProcAddress(module, funcName);
-        if (function == IntPtr.Zero)
-            throw new InvalidOperationException($"GetProcAddress({dllName}!{funcName}) failed.");
-
-        ulong functionAddress = unchecked((ulong)function.ToInt64());
-        List<(string Name, ulong Base, ulong Size)> ourModules = EnumerateModules(NativeMethods.GetCurrentProcess());
-
-        (string Name, ulong Base, ulong Size) containing = default;
-        foreach ((string name, ulong b, ulong size) in ourModules)
-        {
-            if (functionAddress >= b && functionAddress < b + size)
-            {
-                containing = (name, b, size);
-                break;
-            }
-        }
-
-        if (containing.Name is null)
-            throw new InvalidOperationException($"Could not locate the module containing {funcName}.");
-
-        Log($"resolve {funcName}: ours=0x{functionAddress:X} in {containing.Name} base=0x{containing.Base:X} rva=0x{functionAddress - containing.Base:X}");
-
-        List<(string Name, ulong Base, ulong Size)> targetModules = EnumerateModules(target.Handle);
-        foreach ((string name, ulong b, ulong size) in targetModules)
-        {
-            if (string.Equals(name, containing.Name, StringComparison.OrdinalIgnoreCase))
-            {
-                ulong result = b + (functionAddress - containing.Base);
-                Log($"resolve {funcName}: target {name} base=0x{b:X} -> 0x{result:X}");
-                return result;
-            }
-        }
-
-        throw new InvalidOperationException($"Target process does not have {containing.Name}.");
-    }
-
-    private static List<(string Name, ulong Base, ulong Size)> EnumerateModules(IntPtr processHandle)
-    {
-        var result = new List<(string Name, ulong Base, ulong Size)>();
-        var modules = new IntPtr[1024];
-
-        if (!NativeMethods.EnumProcessModules(
-                processHandle, modules, (uint)(modules.Length * IntPtr.Size), out uint needed))
-        {
-            return result;
-        }
-
-        int count = (int)(needed / IntPtr.Size);
-        if (count > modules.Length)
-            count = modules.Length;
-
-        var name = new StringBuilder(260);
-
-        for (int i = 0; i < count; i++)
-        {
-            name.Clear();
-            NativeMethods.GetModuleBaseName(processHandle, modules[i], name, (uint)name.Capacity);
-
-            if (!NativeMethods.GetModuleInformation(
-                    processHandle, modules[i], out NativeMethods.MODULEINFO info,
-                    (uint)Marshal.SizeOf<NativeMethods.MODULEINFO>()))
-            {
-                continue;
-            }
-
-            result.Add((name.ToString(), unchecked((ulong)info.lpBaseOfDll.ToInt64()), info.SizeOfImage));
-        }
-
-        return result;
+        Log($"resolve {dllName}!{funcName} -> 0x{address:X}");
+        return address;
     }
 
     public void Dispose()

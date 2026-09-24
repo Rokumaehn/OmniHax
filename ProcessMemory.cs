@@ -19,13 +19,15 @@ internal sealed class ProcessMemory : IDisposable
     public int ProcessId { get; }
     public string ProcessName { get; }
     public bool Is64BitProcess { get; }
+    public DateTime StartTimeUtc { get; }
 
-    private ProcessMemory(IntPtr handle, int processId, string processName, bool is64Bit)
+    private ProcessMemory(IntPtr handle, int processId, string processName, bool is64Bit, DateTime startTimeUtc)
     {
         Handle = handle;
         ProcessId = processId;
         ProcessName = processName;
         Is64BitProcess = is64Bit;
+        StartTimeUtc = startTimeUtc;
     }
 
     public static ProcessMemory Open(int processId, string processName)
@@ -38,7 +40,19 @@ internal sealed class ProcessMemory : IDisposable
         if (NativeMethods.IsWow64Process(handle, out bool wow64))
             is64Bit = !wow64;
 
-        return new ProcessMemory(handle, processId, processName, is64Bit);
+        DateTime startTimeUtc = DateTime.MinValue;
+        try
+        {
+            using System.Diagnostics.Process process = System.Diagnostics.Process.GetProcessById(processId);
+            startTimeUtc = process.StartTime.ToUniversalTime();
+        }
+        catch (Exception)
+        {
+            // Start time may be unavailable for protected processes; identity
+            // checks then fall back to name/pid only.
+        }
+
+        return new ProcessMemory(handle, processId, processName, is64Bit, startTimeUtc);
     }
 
     /// <summary>
